@@ -54,10 +54,16 @@ func main() {
 	}
 
 	orchestrator.AddRequiredVars(RequiredVars)
-	err = orchestrator.AddEvaluationSuite("osps-baseline", nil, evaluation_plans.OSPS)
-	if err != nil {
-		fmt.Printf("Error adding evaluation suite: %v\n", err)
-		os.Exit(1)
+
+	// Register the same step implementations for each catalog version.
+	// The catalog YAML defines which assessment IDs are active for that version,
+	// so the SDK only runs the relevant subset of steps.
+	for _, catalogID := range []string{"osps-baseline-2025-10", "osps-baseline-2026-02"} {
+		err = orchestrator.AddEvaluationSuite(catalogID, nil, evaluation_plans.OSPS)
+		if err != nil {
+			fmt.Printf("Error adding evaluation suite %s: %v\n", catalogID, err)
+			os.Exit(1)
+		}
 	}
 
 	runCmd := command.NewPluginCommands(

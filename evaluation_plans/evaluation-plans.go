@@ -15,7 +15,11 @@ import (
 )
 
 var (
-	// Open Source Project Security Baseline
+	// OSPS contains assessment step implementations for all known assessment IDs
+	// across all OSPS Baseline versions. Each catalog YAML defines which IDs are
+	// active for that version, so the SDK only runs the relevant subset.
+	// When a new baseline version introduces new assessment IDs, add their step
+	// implementations here.
 	OSPS = map[string][]gemara.AssessmentStep{
 		"OSPS-AC-01.01": {
 			access_control.OrgRequiresMFA,
