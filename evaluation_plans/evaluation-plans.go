@@ -20,7 +20,7 @@ var (
 	// active for that version, so the SDK only runs the relevant subset.
 	// When a new baseline version introduces new assessment IDs, add their step
 	// implementations here.
-	OSPS = map[string][]gemara.AssessmentStep{
+	OSPS_2025_10 = map[string][]gemara.AssessmentStep{
 		"OSPS-AC-01.01": {
 			access_control.OrgRequiresMFA,
 		},
@@ -247,3 +247,33 @@ var (
 		},
 	}
 )
+
+func OSPS_2026_02() map[string][]gemara.AssessmentStep {
+	modifiedCatalog := OSPS_2025_10
+
+	delete(modifiedCatalog, "OSPS-BR-01.02") // This control was removed in v2026-02-19
+
+	modifiedCatalog["OSPS-BR-01.03"] = []gemara.AssessmentStep{
+		reusable_steps.NotImplemented,
+	}
+
+	/* When a CI/CD pipeline operates on untrusted code snapshots, 
+	it MUST prevent access to privileged CI/CD credentials and assets. */	
+	modifiedCatalog["OSPS-BR-01.03"] = []gemara.AssessmentStep{
+		reusable_steps.NotImplemented,
+	}
+
+	/* The project documentation MUST include instructions on 
+	how to build the software, including required libraries, frameworks, SDKs, and dependencies. */
+	modifiedCatalog["OSPS-DO-07.01"] = []gemara.AssessmentStep{
+		reusable_steps.HasSecurityInsightsFile,
+		reusable_steps.NotImplemented, // TODO: Check
+	}
+
+	/* CI/CD pipelines which accept trusted collaborator input 
+	MUST sanitize and validate that input prior to use in the pipeline. */
+	modifiedCatalog["OSPS-BR-01.04"] = []gemara.AssessmentStep{
+		reusable_steps.NotImplemented,
+	}
+	return modifiedCatalog
+}

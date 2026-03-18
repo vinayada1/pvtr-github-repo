@@ -9,6 +9,7 @@ import (
 
 	"github.com/ossf/pvtr-github-repo-scanner/data"
 	"github.com/ossf/pvtr-github-repo-scanner/evaluation_plans"
+	"github.com/gemaraproj/go-gemara"
 
 	"github.com/privateerproj/privateer-sdk/command"
 	"github.com/privateerproj/privateer-sdk/pluginkit"
@@ -55,13 +56,16 @@ func main() {
 
 	orchestrator.AddRequiredVars(RequiredVars)
 
-	// Register the same step implementations for each catalog version.
-	// The catalog YAML defines which assessment IDs are active for that version,
-	// so the SDK only runs the relevant subset of steps.
-	for _, catalogID := range []string{"osps-baseline-2025-10", "osps-baseline-2026-02"} {
-		err = orchestrator.AddEvaluationSuite(catalogID, nil, evaluation_plans.OSPS)
+	catalogs := map[string]map[string][]gemara.AssessmentStep {
+		"osps-baseline": evaluation_plans.OSPS_2025_10,
+		"osps-baseline-2025-10": evaluation_plans.OSPS_2025_10,
+		"osps-baseline-2026-02": evaluation_plans.OSPS_2026_02(),
+	}
+
+	for catalogId, catalog := range catalogs {
+		err = orchestrator.AddEvaluationSuite(catalogId, nil, catalog)
 		if err != nil {
-			fmt.Printf("Error adding evaluation suite %s: %v\n", catalogID, err)
+			fmt.Printf("Error adding evaluation suite %s: %v\n", catalogId, err)
 			os.Exit(1)
 		}
 	}
