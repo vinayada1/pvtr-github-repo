@@ -27,6 +27,37 @@ If the binaries and the config files are in different directories specify the co
 
 You may have to adjust the plugin name in the config.yaml file to match them.
 
+## AI-Assisted Checks
+
+Some checks can use AI to assess repository documentation when AI settings are provided in the scanner config. AI is optional. If AI is not configured, the scanner continues to use its existing non-AI behavior.
+
+For the initial rollout, configure AI with these keys in the scanner config:
+
+```yaml
+ai_provider: openai
+ai_model: <an OpenAI chat model available in your account>
+ai_api_key: <your-openai-api-key>
+ai_timeout: 30s
+ai_max_tokens: 256
+```
+
+Notes:
+
+- `ai_provider`, `ai_model`, and `ai_api_key` are required for live AI-assisted analysis.
+- `ai_timeout` is optional and defaults to `30s`.
+- `ai_max_tokens` is optional and defaults to `256`.
+- Keep API keys in the config only if that matches your local security practices.
+
+When an evaluation uses AI successfully, the result message is prefixed with `[AI-Assisted]`. That label means the check used AI to assess the supplied evidence and returned a structured pass/fail result.
+
+### Currently supported AI-assisted check
+
+OSPS-QA-06.02 uses AI to assess contributor-facing test execution guidance found in README and CONTRIBUTING content.
+
+A passing result means the supporting documentation clearly explains when tests run and how they are run.
+
+If AI is configured incorrectly, unavailable, or returns an unusable response, the scanner falls back to the normal review-needed behavior rather than failing the entire run.
+
 ## Docker Usage
 
 ```sh

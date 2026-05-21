@@ -25,3 +25,11 @@ services:
       repo: <github repo name>
       token: <classic token with permissions repo + admin:org>
 
+# Optional AI configuration for AI-assisted checks.
+# If omitted, the scanner continues to use its existing non-AI behavior.
+# ai_provider: openai
+# ai_model: <an OpenAI chat model available in your account>
+# ai_api_key: <your-openai-api-key>
+# ai_timeout: 30s
+# ai_max_tokens: 256
+
