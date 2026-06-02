@@ -25,3 +25,21 @@ services:
       repo: <github repo name>
       token: <classic token with permissions repo + admin:org>
 
+      # --- AI-assisted evaluation (optional) ---
+      # When these keys are set, AI-capable controls (e.g. OSPS-QA-06.02) call
+      # the configured provider to assess repository documentation. When they
+      # are missing or incomplete, the scanner falls back to its existing
+      # review-needed behavior and no requests leave the host. See the
+      # "AI-Assisted Checks" section of the README for details.
+      #
+      # Required keys (the minimum needed to enable AI):
+      # ai_provider: <provider id>            # AI provider id (only "openai" is supported today; more providers will be added in future releases)
+      # ai_model: <chat model id>             # a chat-completions model id offered by the provider (for example, "gpt-4o-mini")
+      # ai_api_key: <your-provider-api-key>   # provider API key (not required when ai_dry_run is true)
+      #
+      # Optional keys (override defaults):
+      # ai_base_url: https://api.openai.com/v1 # override the OpenAI endpoint (e.g. an OpenAI-compatible self-hosted runtime or local dev proxy); defaults to https://api.openai.com/v1
+      # ai_timeout: 30s                       # per-request timeout (Go duration); default 30s
+      # ai_max_tokens: 256                    # response token budget; default 256
+      # ai_dry_run: false                     # skip real provider calls; default false
+

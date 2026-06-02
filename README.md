@@ -27,6 +27,154 @@ If the binaries and the config files are in different directories specify the co
 
 You may have to adjust the plugin name in the config.yaml file to match them.
 
+## AI-Assisted Checks
+
+Some OSPS Baseline controls can be assessed with the help of a large language
+model (LLM). AI is **opt-in**: when AI settings are absent the scanner
+behaves exactly as before and no requests leave the host.
+
+### Configuration
+
+Add the AI keys under the per-service `vars` block:
+
+```yaml
+services:
+  my-scan:
+    plugin: github-repo
+    vars:
+      owner: <github org or user>
+      repo: <github repo>
+      token: <github classic token>
+
+      # --- Required to enable AI ---
+      ai_provider: <provider id>             # see "Provider examples" below
+      ai_model: <chat model id>              # e.g. gpt-4o-mini
+      ai_api_key: <your-provider-api-key>    # not needed when ai_dry_run is true
+
+      # --- Optional (defaults shown) ---
+      ai_base_url: https://api.openai.com/v1 # override the OpenAI endpoint
+      ai_timeout: 30s                        # per-request timeout
+      ai_max_tokens: 256                     # response token budget
+      ai_dry_run: false                      # skip real provider calls
+```
+
+| Key             | Required | Description                                                                                          |
+| --------------- | :------: | ---------------------------------------------------------------------------------------------------- |
+| `ai_provider`   |   yes    | AI provider id. Only `openai` is supported today.                                                    |
+| `ai_model`      |   yes    | Chat-completions model id offered by the provider (e.g. `gpt-4o-mini`).                              |
+| `ai_api_key`    |   yes¹   | Provider API key. Not persisted to evidence packets.                                                 |
+| `ai_base_url`   |    no    | Override the OpenAI endpoint. Use this to target an OpenAI-compatible endpoint (self-hosted runtime, local mock, dev proxy). The SDK speaks only the OpenAI wire protocol in this release. |
+| `ai_timeout`    |    no    | Per-request timeout as a Go duration (`30s`, `1m`, …).                                               |
+| `ai_max_tokens` |    no    | Maximum tokens in the model response.                                                                |
+| `ai_dry_run`    |    no    | When `true`, skip real provider calls (see [Dry-run](#dry-run)).                                     |
+
+¹ Not required when `ai_dry_run: true`.
+
+If any required key is missing, the scanner skips AI for that check and falls
+back to its existing review-needed behavior; the run does not fail.
+
+### Provider examples
+
+> Only the `openai` provider is implemented in this release. The
+> "OpenAI-compatible endpoint" example below still uses the `openai`
+> provider, just with `ai_base_url` pointed at a different endpoint that
+> speaks the OpenAI wire protocol.
+
+**OpenAI**
+
+```yaml
+ai_provider: openai
+ai_model: <chat model id>   # for example, gpt-4o-mini
+ai_api_key: sk-...
+```
+
+**OpenAI-compatible endpoint** (self-hosted runtime, local mock, or dev proxy)
+
+```yaml
+ai_provider: openai
+ai_model: <chat model id exposed by the endpoint>
+ai_api_key: <key accepted by the endpoint>
+ai_base_url: http://127.0.0.1:8000/v1
+```
+
+### Interpreting `[AI-Assisted]` results
+
+A successful AI-assisted check produces a result message prefixed with
+`[AI-Assisted]`:
+
+```
+[AI-Assisted] verdict=pass confidence=0.91
+reasoning: README explains that contributors run `go test ./...` before opening a PR.
+evidence_location: README#testing
+```
+
+- `verdict` maps to the Gemara result (`pass` → `Passed`, `fail` → `Failed`).
+- `confidence` is the model's self-reported 0–1 score, mapped to Low
+  (`<0.5`), Medium (`<0.8`), or High (`≥0.8`).
+- If the call times out, fails, or returns a malformed response, the result
+  falls back to `NeedsReview` and the run continues.
+
+Treat AI verdicts as a useful signal that still warrants spot-checking,
+especially at Low or Medium confidence.
+
+### Evidence packets
+
+When `write: true` is set in the top-level config, each AI-assisted attempt
+writes the following files:
+
+```
+<write-directory>/<service>/ai-evidence/<control-id>/<timestamp>-<request-id>/
+  assessment.json     # verdict, confidence, reasoning, redacted config snapshot
+  ai_interaction.json # prompt, schema, supplied evidence, raw model response
+```
+
+The SDK redacts known secrets from both files before writing them:
+`ai_api_key`, `token`, credentials embedded in `ai_base_url`, and common
+bearer-token / GitHub-token patterns. Packets are intended for human review
+and for re-running the assessment offline.
+
+### Cost and operational notes
+
+- **One provider call per applicable control per scan**, cached for the
+  duration of the run.
+- The scanner sends only the specific repository content the check needs as
+  evidence (e.g. documentation files or configuration snippets), not the
+  full repository or its source code.
+- You are responsible for any provider usage charges. Start with a low-cost
+  model (a `-mini`-class chat-completions model is usually sufficient) and a
+  small `ai_max_tokens` budget.
+
+### Currently supported AI-assisted checks
+
+| Control         | What it assesses                                                                                            |
+| --------------- | ----------------------------------------------------------------------------------------------------------- |
+| `OSPS-QA-06.02` | Whether contributor-facing documentation (README, `CONTRIBUTING`) explains *when* and *how* tests are run. |
+
+### Dry-run
+
+Set `ai_dry_run: true` (or pass `--dry-run-ai` on the `pvtr` command line) to
+exercise the AI-assisted code paths without making a real provider call. The
+SDK returns a fixed placeholder response with `finish_reason: dry_run` and
+logs the prompt and schema instead of sending them to the provider.
+
+```yaml
+ai_provider: <provider id>   # for example, openai
+ai_model: <chat model id>    # for example, gpt-4o-mini
+ai_dry_run: true
+```
+
+Use dry-run to:
+
+- check that your config is valid and that the scanner picks up the AI keys,
+- produce evidence packets in CI without using any provider quota,
+- inspect the exact prompt and schema the scanner would send.
+
+`ai_api_key` is not required in this mode, but `ai_provider` and `ai_model`
+still are. Because the placeholder response carries no real verdict,
+AI-assisted checks fall back to their standard `NeedsReview` message in
+dry-run mode; `assessment.json` and `ai_interaction.json` are still written
+when `write: true`.
+
 ## Docker Usage
 
 ```sh
