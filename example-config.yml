@@ -42,4 +42,5 @@ services:
       # ai_timeout: 30s                       # per-request timeout (Go duration); default 30s
       # ai_max_tokens: 256                    # response token budget; default 256
       # ai_dry_run: false                     # skip real provider calls; default false
+      # ai_write_evidence: false              # persist AI evidence packets; requires AI config and write: true; default false
 

@@ -56,6 +56,7 @@ services:
       ai_timeout: 30s                        # per-request timeout
       ai_max_tokens: 256                     # response token budget
       ai_dry_run: false                      # skip real provider calls
+      ai_write_evidence: false               # persist AI evidence packets
 ```
 
 | Key             | Required | Description                                                                                          |
@@ -67,6 +68,7 @@ services:
 | `ai_timeout`    |    no    | Per-request timeout as a Go duration (`30s`, `1m`, …).                                               |
 | `ai_max_tokens` |    no    | Maximum tokens in the model response.                                                                |
 | `ai_dry_run`    |    no    | When `true`, skip real provider calls (see [Dry-run](#dry-run)).                                     |
+| `ai_write_evidence` | no | When `true`, persist AI evidence packets. Requires AI to be configured and `write: true`. Defaults to `false`. |
 
 ¹ Not required when `ai_dry_run: true`.
 
@@ -119,8 +121,10 @@ especially at Low or Medium confidence.
 
 ### Evidence packets
 
-When `write: true` is set in the top-level config, each AI-assisted attempt
-writes the following files:
+Evidence packet writing is a separate opt-in from enabling AI. When AI is
+configured, `write: true` is set in the top-level config, and
+`ai_write_evidence: true` is set in `vars` (or `--write-ai-evidence` is passed
+on the command line), each AI-assisted attempt writes the following files:
 
 ```
 <write-directory>/<service>/ai-evidence/<control-id>/<timestamp>-<request-id>/
@@ -128,10 +132,14 @@ writes the following files:
   ai_interaction.json # prompt, schema, supplied evidence, raw model response
 ```
 
-The SDK redacts known secrets from both files before writing them:
+The SDK owns the provider-neutral packet format and redacts known secrets from
+both files before writing them:
 `ai_api_key`, `token`, credentials embedded in `ai_base_url`, and common
 bearer-token / GitHub-token patterns. Packets are intended for human review
 and for re-running the assessment offline.
+
+Leave `ai_write_evidence` unset or `false` in routine CI jobs unless you intend
+to retain the prompt, evidence, schema, response, and mapped verdict artifacts.
 
 ### Cost and operational notes
 
@@ -166,14 +174,14 @@ ai_dry_run: true
 Use dry-run to:
 
 - check that your config is valid and that the scanner picks up the AI keys,
-- produce evidence packets in CI without using any provider quota,
+- optionally produce evidence packets without using any provider quota,
 - inspect the exact prompt and schema the scanner would send.
 
 `ai_api_key` is not required in this mode, but `ai_provider` and `ai_model`
 still are. Because the placeholder response carries no real verdict,
 AI-assisted checks fall back to their standard `NeedsReview` message in
-dry-run mode; `assessment.json` and `ai_interaction.json` are still written
-when `write: true`.
+dry-run mode; `assessment.json` and `ai_interaction.json` are written only when
+both `write: true` and `ai_write_evidence: true` are set.
 
 ## Docker Usage
 
