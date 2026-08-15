@@ -2,65 +2,20 @@ package quality
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/gemaraproj/go-gemara"
-	hclog "github.com/hashicorp/go-hclog"
 	"github.com/ossf/pvtr-github-repo-scanner/data"
+	"github.com/ossf/pvtr-github-repo-scanner/evaluation_plans/reusable_steps"
 	sdkai "github.com/privateerproj/privateer-sdk/ai"
 )
 
 const testExecutionDocumentationFallbackMessage = "Review project documentation to ensure it explains when and how tests are run"
 
-var testExecutionDocumentationSchema = &sdkai.Schema{
-	Name:        "test_execution_documentation_assessment",
-	Description: "Structured assessment of whether repository documentation explains when and how tests are run.",
-	Strict:      true,
-	Value: json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"verdict": {"type": "string", "enum": ["pass", "fail"]},
-			"confidence": {"type": "number"},
-			"reasoning": {"type": "string"},
-			"evidence_location": {"type": "string"}
-		},
-		"required": ["verdict", "confidence", "reasoning", "evidence_location"],
-		"additionalProperties": false
-	}`),
-}
-
-var newAIClientFromConfig = sdkai.NewClientFromConfig
+// Both vars are seams for tests to stub the AI client and evidence loader.
+var newAIClientFromConfig = sdkai.NewClient
 var loadTestExecutionDocumentationEvidence = testExecutionDocumentationEvidence
-
-var testExecutionDocumentationRunCache = struct {
-	mu      sync.Mutex
-	results map[string]testExecutionDocumentationCachedResult
-}{
-	results: map[string]testExecutionDocumentationCachedResult{},
-}
-
-type testExecutionDocumentationAssessment struct {
-	Verdict          string  `json:"verdict"`
-	Confidence       float64 `json:"confidence"`
-	Reasoning        string  `json:"reasoning"`
-	EvidenceLocation string  `json:"evidence_location"`
-}
-
-type testExecutionDocumentationCachedResult struct {
-	Result     gemara.Result
-	Message    string
-	Confidence gemara.ConfidenceLevel
-}
-
-type testExecutionDocumentationPacketOutcome string
-
-const (
-	testExecutionDocumentationPacketOutcomeSucceeded testExecutionDocumentationPacketOutcome = "succeeded"
-	testExecutionDocumentationPacketOutcomeFailed    testExecutionDocumentationPacketOutcome = "failed"
-)
 
 func RepoIsPublic(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
 	if payload.RepositoryMetadata.IsPublic() {
@@ -88,19 +43,13 @@ func StatusChecksAreRequiredByRulesets(payload data.Payload) (result gemara.Resu
 		}
 	}
 
-	// get the rules that apply to the default branch
-	rules := payload.GetRulesets(payload.Repository.DefaultBranchRef.Name)
-	if len(rules) == 0 {
+	// Branch rulesets are fetched once during payload load.
+	if !payload.RepositoryMetadata.HasBranchRules() {
 		return gemara.Passed, "No rulesets found for default branch, continuing to evaluate branch protection", confidence
 	}
 
 	// get the name of all required status checks
-	var requiredChecks []string
-	for _, rule := range payload.Rulesets {
-		for _, requiredCheck := range rule.Parameters.RequiredChecks {
-			requiredChecks = append(requiredChecks, requiredCheck.Context)
-		}
-	}
+	requiredChecks := payload.RepositoryMetadata.RequiredStatusCheckContexts()
 
 	// check whether all executed checks are required
 	missingChecks := []string{}
@@ -162,9 +111,9 @@ func StatusChecksAreRequiredByBranchProtection(payload data.Payload) (result gem
 func NoBinariesInRepo(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
 	// TODO: This only checks the top 3 levels of the repository tree
 	// for common binary file extensions and it fails on very large repositories.
-	suspectedBinaries, err := payload.GetSuspectedBinaries()
-	if err != nil {
-		payload.Config.Logger.Trace(fmt.Sprintf("unexpected response while checking for binaries: %s", err.Error()))
+	suspectedBinaries := payload.Binaries.Suspected
+	if payload.Binaries.Err != nil {
+		payload.Config.Logger.Trace(fmt.Sprintf("unexpected response while checking for binaries: %s", payload.Binaries.Err.Error()))
 		return gemara.Unknown, "Error while scanning repository for binaries, potentially due to repo size. See logs for details.", confidence
 	}
 
@@ -179,11 +128,9 @@ func NoBinariesInRepo(payload data.Payload) (result gemara.Result, message strin
 // artifacts such as compiled executables, shared libraries, or archive binaries.
 // Acceptable binary content (images, audio, video, fonts, PDFs) is not flagged.
 func NoUnreviewableBinariesInRepo(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
-	unreviewableBinaries, err := payload.GetUnreviewableBinaries()
-	if err != nil {
-		if payload.Config != nil && payload.Config.Logger != nil {
-			payload.Config.Logger.Trace(fmt.Sprintf("unexpected response while checking for unreviewable binaries: %s", err.Error()))
-		}
+	unreviewableBinaries := payload.Binaries.Unreviewable
+	if payload.Binaries.Err != nil {
+		payload.Config.Logger.Trace(fmt.Sprintf("unexpected response while checking for unreviewable binaries: %s", payload.Binaries.Err.Error()))
 		return gemara.Unknown, "Error while scanning repository for unreviewable binaries, potentially due to repo size. See logs for details.", confidence
 	}
 
@@ -242,204 +189,151 @@ func VerifyDependencyManagement(payload data.Payload) (result gemara.Result, mes
 	return countDependencyManifests(payload)
 }
 
+// dependencyManifestNames are well-known dependency manifest and lockfile names,
+// matched case-insensitively against exact file names in the repository root.
+var dependencyManifestNames = []string{
+	"go.mod", "go.sum",
+	"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+	"requirements.txt", "requirements-dev.txt", "Pipfile", "Pipfile.lock",
+	"pyproject.toml", "poetry.lock", "uv.lock", "setup.py", "setup.cfg",
+	"Cargo.toml", "Cargo.lock",
+	"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+	"Gemfile", "Gemfile.lock",
+	"composer.json", "composer.lock",
+	"mix.exs", "Package.swift", "pubspec.yaml", "packages.config",
+	"flake.nix", "vcpkg.json", "conanfile.txt", "conanfile.py",
+}
+
 func countDependencyManifests(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
 	manifestsCount := payload.DependencyManifestsCount
 	if manifestsCount > 0 {
-		return gemara.Passed, fmt.Sprintf("Found %d dependency manifests from GitHub API", manifestsCount), confidence
+		return gemara.Passed, fmt.Sprintf("Found %d dependency manifests from GitHub API", manifestsCount), gemara.High
 	}
-	return gemara.NeedsReview, "No dependency manifests found in the GitHub dependency graph API. Review project to ensure dependencies are managed.", confidence
+
+	// The dependency graph API returned nothing, which happens when the graph is
+	// disabled or has not indexed the repo. Fall back to direct observation of the
+	// root tree before punting to NeedsReview.
+	found := findDependencyManifests(payload)
+	if len(found) > 0 {
+		return gemara.Passed, fmt.Sprintf("dependency manifest(s) found in repository root: %s", strings.Join(found, ", ")), gemara.Medium
+	}
+
+	return gemara.NeedsReview, "No dependency manifests found in the GitHub dependency graph API. Review project to ensure dependencies are managed.", gemara.Low
 }
 
-func TestExecutionDocumentation(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
-	logger := testExecutionDocumentationLogger(payload)
-	cacheKey := testExecutionDocumentationCacheKey(payload)
-	if cachedResult, ok := lookupTestExecutionDocumentationCachedResult(cacheKey); ok {
-		logger.Trace("OSPS-QA-06.02: reusing cached AI verdict", "cache_key", cacheKey)
-		return cachedResult.Result, cachedResult.Message, cachedResult.Confidence
-	}
-	storeAndReturn := func(result gemara.Result, message string, confidence gemara.ConfidenceLevel) (gemara.Result, string, gemara.ConfidenceLevel) {
-		storeTestExecutionDocumentationCachedResult(cacheKey, testExecutionDocumentationCachedResult{
-			Result:     result,
-			Message:    message,
-			Confidence: confidence,
-		})
-		return result, message, confidence
+// findDependencyManifests scans the repository root tree (blobs only) for
+// well-known dependency manifests and lockfiles, returning the matched names.
+func findDependencyManifests(payload data.Payload) []string {
+	if payload.GraphqlRepoData == nil {
+		return nil
 	}
 
-	client, err := testExecutionDocumentationClient(payload)
-	if err != nil {
-		writeTestExecutionDocumentationFailurePacket(payload, logger, testExecutionDocumentationPacketDetails{
-			Prompt:       testExecutionDocumentationPrompt(),
-			Outcome:      testExecutionDocumentationPacketOutcomeFailed,
-			AttemptStage: "client_construction",
-			Failure:      err,
-		})
-		logger.Warn("OSPS-QA-06.02: AI client construction failed", "err", err)
+	var found []string
+	for _, entry := range payload.Repository.Object.Tree.Entries {
+		if entry.Type != "blob" {
+			continue
+		}
+		if isDependencyManifest(entry.Name) {
+			found = append(found, entry.Name)
+		}
+	}
+	return found
+}
+
+// isDependencyManifest reports whether name is a well-known dependency manifest,
+// matching known names case-insensitively plus any *.csproj project file.
+func isDependencyManifest(name string) bool {
+	if strings.HasSuffix(strings.ToLower(name), ".csproj") {
+		return true
+	}
+	for _, manifest := range dependencyManifestNames {
+		if strings.EqualFold(name, manifest) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestExecutionDocumentation assesses OSPS-QA-06.02: whether the project
+// documents when and how tests are run. Uses AI when configured, otherwise
+// falls back to manual review.
+func TestExecutionDocumentation(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
+	if payload.Config == nil {
 		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
+	}
+
+	client, err := newAIClientFromConfig(*payload.Config)
+	if err != nil {
+		return reusable_steps.AIFallback(payload, "OSPS-QA-06.02", testExecutionDocumentationFallbackMessage, "AI client construction failed", err)
 	}
 	if client == nil {
-		logger.Warn("OSPS-QA-06.02: AI is not configured (ai_provider/ai_api_key missing); falling back")
+		// AI is not configured; keep the legacy manual-review verdict.
 		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
 	}
 
-	evidence, err := loadTestExecutionDocumentationEvidence(payload)
+	material, sources, err := loadTestExecutionDocumentationEvidence(payload)
 	if err != nil {
-		logger.Warn("OSPS-QA-06.02: failed to load README/CONTRIBUTING evidence", "err", err)
-		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
+		return reusable_steps.AIFallback(payload, "OSPS-QA-06.02", testExecutionDocumentationFallbackMessage, "unable to gather README/CONTRIBUTING evidence", err)
 	}
-	if strings.TrimSpace(evidence) == "" {
-		logger.Warn("OSPS-QA-06.02: no README or CONTRIBUTING content available in payload")
-		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
-	}
-	sources := testExecutionDocumentationEvidenceSources(payload, evidence)
 
-	response, err := client.Analyze(context.Background(), testExecutionDocumentationPrompt(), evidence, testExecutionDocumentationSchema)
+	response, aiEvidence, err := sdkai.Assist(context.Background(), client, sdkai.Question{
+		Prompt:   testExecutionDocumentationPrompt,
+		Material: material,
+	})
 	if err != nil {
-		writeTestExecutionDocumentationFailurePacket(payload, logger, testExecutionDocumentationPacketDetails{
-			Prompt:       testExecutionDocumentationPrompt(),
-			Evidence:     evidence,
-			Sources:      sources,
-			Outcome:      testExecutionDocumentationPacketOutcomeFailed,
-			AttemptStage: "provider_call",
-			Failure:      err,
-		})
-		logger.Warn("OSPS-QA-06.02: AI provider call failed", "err", err)
-		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
+		return reusable_steps.AIFallback(payload, "OSPS-QA-06.02", testExecutionDocumentationFallbackMessage, "AI assessment failed", err)
 	}
 
-	assessment, err := parseTestExecutionDocumentationAssessment(response)
-	if err != nil {
-		writeTestExecutionDocumentationFailurePacket(payload, logger, testExecutionDocumentationPacketDetails{
-			Prompt:       testExecutionDocumentationPrompt(),
-			Evidence:     evidence,
-			Sources:      sources,
-			Response:     response,
-			Outcome:      testExecutionDocumentationPacketOutcomeFailed,
-			AttemptStage: "schema_validation",
-			Failure:      err,
-		})
-		logger.Warn("OSPS-QA-06.02: AI response failed schema validation", "err", err)
-		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
+	// Attach source locations to the evidence so reviewers know what the AI saw.
+	if len(sources) > 0 {
+		aiEvidence.Description = fmt.Sprintf("AI Assisted Review of %s", strings.Join(sources, ", "))
 	}
+	payload.AddEvidence(aiEvidence)
 
-	result, ok := testExecutionDocumentationResult(assessment.Verdict)
-	if !ok {
-		writeTestExecutionDocumentationFailurePacket(payload, logger, testExecutionDocumentationPacketDetails{
-			Prompt:       testExecutionDocumentationPrompt(),
-			Evidence:     evidence,
-			Sources:      sources,
-			Response:     response,
-			Assessment:   assessment,
-			Outcome:      testExecutionDocumentationPacketOutcomeFailed,
-			AttemptStage: "unknown_verdict",
-			Failure:      fmt.Errorf("unknown verdict %q", assessment.Verdict),
-		})
-		logger.Warn("OSPS-QA-06.02: AI returned unknown verdict", "verdict", assessment.Verdict)
-		return gemara.NeedsReview, testExecutionDocumentationFallbackMessage, confidence
-	}
-	sanitizedAssessment := sanitizeTestExecutionDocumentationAssessment(payload, assessment)
-
-	// Logs keep the verdict summary but avoid persisting raw model-selected
-	// snippets from repository content.
-	logger.Info("OSPS-QA-06.02: AI verdict received",
-		"verdict", sanitizedAssessment.Verdict,
-		"confidence", sanitizedAssessment.Confidence,
-		"evidence_location", sanitizedAssessment.EvidenceLocation,
-	)
-
-	message = fmt.Sprintf(
-		"[AI-Assisted] verdict=%s confidence=%.2f\nreasoning: %s\nevidence_location: %s",
-		assessment.Verdict, assessment.Confidence,
-		assessment.Reasoning, assessment.EvidenceLocation,
-	)
-	if err := captureTestExecutionDocumentationEvidencePacket(payload, testExecutionDocumentationPacketDetails{
-		Prompt:     testExecutionDocumentationPrompt(),
-		Evidence:   evidence,
-		Sources:    sources,
-		Response:   response,
-		Assessment: assessment,
-		Result:     result,
-		Message:    message,
-		Confidence: mapAIConfidence(assessment.Confidence),
-		Outcome:    testExecutionDocumentationPacketOutcomeSucceeded,
-	}); err != nil {
-		logger.Warn("OSPS-QA-06.02: failed to write AI evidence packet", "err", err)
-	}
-	return storeAndReturn(result, message, mapAIConfidence(assessment.Confidence))
+	return response.GemaraResult(), response.Summary(), response.GemaraConfidence()
 }
 
-// testExecutionDocumentationLogger returns the payload's logger, or a no-op
-// logger when one is not wired through. The logger is only used for
-// diagnostic breadcrumbs along the early-exit paths.
-func testExecutionDocumentationLogger(payload data.Payload) hclog.Logger {
-	if payload.Config != nil && payload.Config.Logger != nil {
-		return payload.Config.Logger
-	}
-	return hclog.NewNullLogger()
-}
-
-// mapAIConfidence converts the model's 0..1 confidence score into a gemara
-// ConfidenceLevel bucket. A zero score is treated as Undetermined so callers
-// that omit confidence don't get misreported as Low.
-func mapAIConfidence(score float64) gemara.ConfidenceLevel {
-	switch {
-	case score <= 0:
-		return gemara.Undetermined
-	case score < 0.5:
-		return gemara.Low
-	case score < 0.8:
-		return gemara.Medium
-	default:
-		return gemara.High
-	}
-}
-
+// DocumentsTestMaintenancePolicy assesses OSPS-QA-06.03: whether the project
+// documents a policy for maintaining tests. Currently defers to manual review.
 func DocumentsTestMaintenancePolicy(payload data.Payload) (result gemara.Result, message string, confidence gemara.ConfidenceLevel) {
 	return gemara.NeedsReview, "Review project documentation to ensure it contains a clear policy for maintaining tests", confidence
 }
 
-func testExecutionDocumentationClient(payload data.Payload) (sdkai.Client, error) {
-	if payload.Config == nil {
-		return nil, nil
+// testExecutionDocumentationEvidence gathers README and CONTRIBUTING content
+// as AI input for OSPS-QA-06.02. Only these two files are included because the
+// control targets contributor-facing test guidance.
+func testExecutionDocumentationEvidence(payload data.Payload) (material string, sources []string, err error) {
+	var parts []string
+
+	readme, err := testExecutionDocumentationReadmeContent(payload)
+	if err != nil {
+		return "", nil, err
 	}
-	return newAIClientFromConfig(*payload.Config)
-}
-
-func testExecutionDocumentationEvidence(payload data.Payload) (string, error) {
-	parts := []string{}
-
-	if readme := strings.TrimSpace(testExecutionDocumentationReadmeContent(payload)); readme != "" {
+	if readme = strings.TrimSpace(readme); readme != "" {
 		parts = append(parts, "README\n"+readme)
+		if readmePath := testExecutionDocumentationReadmePath(payload); readmePath != "" {
+			sources = append(sources, testExecutionDocumentationEvidenceSource(payload, readmePath))
+		} else {
+			sources = append(sources, "/README")
+		}
 	}
 
 	if payload.GraphqlRepoData != nil {
 		if contributing := strings.TrimSpace(payload.Repository.ContributingGuidelines.Body); contributing != "" {
 			parts = append(parts, "CONTRIBUTING\n"+contributing)
+			if contributingPath := testExecutionDocumentationContributingPath(payload); contributingPath != "" {
+				sources = append(sources, testExecutionDocumentationEvidenceSource(payload, contributingPath))
+			} else {
+				sources = append(sources, "/CONTRIBUTING")
+			}
 		}
 	}
 
 	if len(parts) == 0 {
-		return "", fmt.Errorf("no README or CONTRIBUTING content available")
+		return "", nil, fmt.Errorf("no README or CONTRIBUTING content available")
 	}
 
-	return strings.Join(parts, "\n\n"), nil
-}
-
-func testExecutionDocumentationEvidenceSources(payload data.Payload, evidence string) []string {
-	sources := []string{}
-	if readmePath := testExecutionDocumentationReadmePath(payload); readmePath != "" {
-		sources = append(sources, testExecutionDocumentationEvidenceSource(payload, readmePath))
-	}
-	if contributingPath := testExecutionDocumentationContributingPath(payload); contributingPath != "" {
-		sources = append(sources, testExecutionDocumentationEvidenceSource(payload, contributingPath))
-	}
-	if len(sources) == 0 && strings.Contains(evidence, "README\n") {
-		sources = append(sources, "/README")
-	}
-	if len(sources) == 0 && strings.Contains(evidence, "CONTRIBUTING\n") {
-		sources = append(sources, "/CONTRIBUTING")
-	}
-	return sources
+	return strings.Join(parts, "\n\n"), sources, nil
 }
 
 func testExecutionDocumentationEvidenceSource(payload data.Payload, path string) string {
@@ -470,59 +364,6 @@ func testExecutionDocumentationBlobURL(payload data.Payload, path string) string
 	return fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s", repositoryOwner, repositoryName, commitSHA, trimmedPath)
 }
 
-func testExecutionDocumentationCacheKey(payload data.Payload) string {
-	if payload.Config == nil {
-		return ""
-	}
-	writeDir := strings.TrimSpace(payload.Config.WriteDirectory)
-	if writeDir == "" {
-		return ""
-	}
-	serviceName := strings.TrimSpace(payload.Config.ServiceName)
-	repositoryOwner := strings.TrimSpace(payload.Config.GetString("owner"))
-	repositoryName := strings.TrimSpace(payload.Config.GetString("repo"))
-	commitSHA := ""
-	if payload.GraphqlRepoData != nil {
-		if strings.TrimSpace(payload.Repository.Name) != "" {
-			repositoryName = strings.TrimSpace(payload.Repository.Name)
-		}
-		commitSHA = strings.TrimSpace(payload.Repository.DefaultBranchRef.Target.OID)
-	}
-	return strings.Join([]string{
-		writeDir,
-		serviceName,
-		repositoryOwner,
-		repositoryName,
-		commitSHA,
-		"OSPS-QA-06.02",
-	}, "|")
-}
-
-func lookupTestExecutionDocumentationCachedResult(cacheKey string) (testExecutionDocumentationCachedResult, bool) {
-	if cacheKey == "" {
-		return testExecutionDocumentationCachedResult{}, false
-	}
-	testExecutionDocumentationRunCache.mu.Lock()
-	defer testExecutionDocumentationRunCache.mu.Unlock()
-	result, ok := testExecutionDocumentationRunCache.results[cacheKey]
-	return result, ok
-}
-
-func storeTestExecutionDocumentationCachedResult(cacheKey string, result testExecutionDocumentationCachedResult) {
-	if cacheKey == "" {
-		return
-	}
-	testExecutionDocumentationRunCache.mu.Lock()
-	defer testExecutionDocumentationRunCache.mu.Unlock()
-	testExecutionDocumentationRunCache.results[cacheKey] = result
-}
-
-func resetTestExecutionDocumentationCachedResults() {
-	testExecutionDocumentationRunCache.mu.Lock()
-	defer testExecutionDocumentationRunCache.mu.Unlock()
-	testExecutionDocumentationRunCache.results = map[string]testExecutionDocumentationCachedResult{}
-}
-
 func testExecutionDocumentationRepoAbsolutePath(path string) string {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
@@ -531,27 +372,35 @@ func testExecutionDocumentationRepoAbsolutePath(path string) string {
 	return "/" + strings.TrimLeft(trimmed, "/")
 }
 
-func testExecutionDocumentationReadmeContent(payload data.Payload) string {
+// testExecutionDocumentationReadmeContent returns the README body for AI
+// evidence. It distinguishes "README absent" (empty string, nil error, so the
+// caller simply skips it) from a transient fetch/decode failure (non-nil
+// error). Propagating the error lets the caller route infra hiccups to manual
+// review instead of judging on partial evidence and returning a false negative.
+func testExecutionDocumentationReadmeContent(payload data.Payload) (string, error) {
 	if payload.GraphqlRepoData == nil || payload.RestData == nil {
-		return ""
+		return "", nil
 	}
 
 	readmePath := testExecutionDocumentationReadmePath(payload)
 	if readmePath == "" {
-		return ""
+		return "", nil
 	}
 
-	content, err := payload.RestData.GetFileContent(readmePath)
-	if err != nil || content == nil {
-		return ""
+	content, err := payload.GetFileContent(readmePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve README content at %s: %w", readmePath, err)
+	}
+	if content == nil {
+		return "", fmt.Errorf("no README content returned for %s", readmePath)
 	}
 
 	readme, err := content.GetContent()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("failed to decode README content at %s: %w", readmePath, err)
 	}
 
-	return strings.TrimSpace(readme)
+	return strings.TrimSpace(readme), nil
 }
 
 func testExecutionDocumentationReadmePath(payload data.Payload) string {
@@ -590,182 +439,22 @@ func testExecutionDocumentationContributingPath(payload data.Payload) string {
 	return ""
 }
 
-func testExecutionDocumentationPrompt() string {
-	return strings.TrimSpace(`You are assessing OSPS-QA-06.02: the project's documentation MUST clearly document WHEN and HOW tests are run. This is a contributor-facing requirement.
+const testExecutionDocumentationPrompt = `You are assessing OSPS-QA-06.02: the project's documentation MUST clearly document WHEN and HOW tests are run. This is a contributor-facing requirement.
 
 Use only the supplied README and CONTRIBUTING content as evidence.
 
-Return verdict "pass" only when BOTH of the following are clearly explained:
+Return result "pass" only when BOTH of the following are clearly explained:
   - WHEN tests run (e.g. on every pull request, before merge, on a schedule, locally before commit).
   - HOW tests are run (concrete commands to run tests locally AND/OR a description of how they run in CI/CD).
 
 A pass is stronger when the documentation also explains what the tests cover and how to interpret results, but those are not strictly required.
 
-Return verdict "fail" when any of the following hold:
+Return result "fail" when any of the following hold:
   - The documentation is missing or only implies that tests exist.
   - It covers WHEN but not HOW, or HOW but not WHEN.
   - Instructions are vague (e.g. "run the tests" with no command or workflow reference).
   - The only test discussion is aimed at end users, not contributors.
 
-Cite the most relevant section header or quoted snippet in evidence_location.`)
-}
+Reserve result "needs_review" for evidence you genuinely cannot judge either way.
 
-func parseTestExecutionDocumentationAssessment(response *sdkai.AnalyzeResponse) (*testExecutionDocumentationAssessment, error) {
-	if response == nil || len(response.JSON) == 0 {
-		return nil, fmt.Errorf("ai response did not include structured output")
-	}
-
-	var assessment testExecutionDocumentationAssessment
-	if err := json.Unmarshal(response.JSON, &assessment); err != nil {
-		return nil, err
-	}
-
-	assessment.Verdict = strings.ToLower(strings.TrimSpace(assessment.Verdict))
-	assessment.Reasoning = strings.TrimSpace(assessment.Reasoning)
-	assessment.EvidenceLocation = strings.TrimSpace(assessment.EvidenceLocation)
-	if assessment.Reasoning == "" || assessment.EvidenceLocation == "" {
-		return nil, fmt.Errorf("ai response missing reasoning or evidence location")
-	}
-
-	return &assessment, nil
-}
-
-func testExecutionDocumentationResult(verdict string) (gemara.Result, bool) {
-	// verdict is already lowercased and trimmed by
-	// parseTestExecutionDocumentationAssessment, the sole caller.
-	switch verdict {
-	case "pass":
-		return gemara.Passed, true
-	case "fail":
-		return gemara.Failed, true
-	default:
-		return gemara.NeedsReview, false
-	}
-}
-
-// testExecutionDocumentationPacketDetails carries whichever artifacts are
-// available for a given AI attempt, whether it ended in a usable verdict or
-// a fallback. It is the control-specific input that captureTestExecutionDocumentationEvidencePacket
-// translates into a provider-neutral sdkai.PacketAttempt.
-type testExecutionDocumentationPacketDetails struct {
-	Prompt       string
-	Evidence     string
-	Sources      []string
-	Response     *sdkai.AnalyzeResponse
-	Assessment   *testExecutionDocumentationAssessment
-	Result       gemara.Result
-	Message      string
-	Confidence   gemara.ConfidenceLevel
-	Outcome      testExecutionDocumentationPacketOutcome
-	AttemptStage string
-	Failure      error
-}
-
-// captureTestExecutionDocumentationEvidencePacket persists the per-attempt
-// AI evidence packet for OSPS-QA-06.02 by delegating to the SDK's
-// provider-neutral packet writer. The shim is responsible only for mapping
-// control-specific verdict types and repository payload fields onto the
-// generic sdkai.PacketAttempt; redaction, file layout, and on-disk format
-// live in the SDK so future AI-assisted controls can reuse them.
-func captureTestExecutionDocumentationEvidencePacket(payload data.Payload, details testExecutionDocumentationPacketDetails) error {
-	if payload.Config == nil {
-		return nil
-	}
-
-	repositoryName := strings.TrimSpace(payload.Config.GetString("repo"))
-	defaultBranch := ""
-	commitSHA := ""
-	if payload.GraphqlRepoData != nil {
-		if strings.TrimSpace(payload.Repository.Name) != "" {
-			repositoryName = strings.TrimSpace(payload.Repository.Name)
-		}
-		defaultBranch = strings.TrimSpace(payload.Repository.DefaultBranchRef.Name)
-		commitSHA = strings.TrimSpace(payload.Repository.DefaultBranchRef.Target.OID)
-	}
-
-	attempt := sdkai.PacketAttempt{
-		ControlID:         "OSPS-QA-06.02",
-		RepositoryOwner:   strings.TrimSpace(payload.Config.GetString("owner")),
-		RepositoryName:    repositoryName,
-		DefaultBranch:     defaultBranch,
-		CommitSHA:         commitSHA,
-		Outcome:           string(details.Outcome),
-		AttemptStage:      resolvePacketAttemptStage(details),
-		Result:            fmt.Sprintf("%v", details.Result),
-		Confidence:        fmt.Sprintf("%v", details.Confidence),
-		AssessmentMessage: resolvePacketAttemptMessage(details),
-		Failure:           details.Failure,
-		Prompt:            details.Prompt,
-		Schema:            testExecutionDocumentationSchema,
-		Evidence:          details.Evidence,
-		EvidenceSources:   details.Sources,
-		Response:          details.Response,
-	}
-	if details.Assessment != nil {
-		attempt.Verdict = details.Assessment.Verdict
-		attempt.Reasoning = details.Assessment.Reasoning
-		attempt.EvidenceLocation = details.Assessment.EvidenceLocation
-	}
-
-	return sdkai.WritePacket(*payload.Config, attempt)
-}
-
-// writeTestExecutionDocumentationFailurePacket persists a failure-path
-// evidence packet and surfaces any packet-writer error to the logger so a
-// broken writer does not silently disappear on the failure paths the way it
-// would have with an `_ =` discard.
-func writeTestExecutionDocumentationFailurePacket(payload data.Payload, logger hclog.Logger, details testExecutionDocumentationPacketDetails) {
-	if err := captureTestExecutionDocumentationEvidencePacket(payload, details); err != nil {
-		logger.Warn("OSPS-QA-06.02: failed to write AI evidence packet",
-			"attempt_stage", details.AttemptStage,
-			"err", err,
-		)
-	}
-}
-
-func resolvePacketAttemptStage(details testExecutionDocumentationPacketDetails) string {
-	if strings.TrimSpace(details.AttemptStage) != "" {
-		return details.AttemptStage
-	}
-	if details.Outcome == testExecutionDocumentationPacketOutcomeSucceeded {
-		return "assessment_completed"
-	}
-	return "attempt_recorded"
-}
-
-func resolvePacketAttemptMessage(details testExecutionDocumentationPacketDetails) string {
-	if strings.TrimSpace(details.Message) != "" {
-		return details.Message
-	}
-	if details.Outcome == testExecutionDocumentationPacketOutcomeFailed && details.Failure != nil {
-		return testExecutionDocumentationFallbackMessage
-	}
-	if details.Failure != nil {
-		return details.Failure.Error()
-	}
-	return ""
-}
-
-// sanitizeTestExecutionDocumentationAssessment redacts model-derived fields
-// before they are surfaced in scanner logs, reusing the SDK sanitizer so the
-// rules stay aligned with what WritePacket persists.
-func sanitizeTestExecutionDocumentationAssessment(payload data.Payload, assessment *testExecutionDocumentationAssessment) testExecutionDocumentationAssessment {
-	if assessment == nil {
-		return testExecutionDocumentationAssessment{}
-	}
-	if payload.Config == nil {
-		return testExecutionDocumentationAssessment{
-			Verdict:          assessment.Verdict,
-			Confidence:       assessment.Confidence,
-			Reasoning:        sdkai.RedactPatterns(assessment.Reasoning),
-			EvidenceLocation: sdkai.RedactPatterns(assessment.EvidenceLocation),
-		}
-	}
-	sanitizer := sdkai.NewSanitizer(*payload.Config)
-	return testExecutionDocumentationAssessment{
-		Verdict:          assessment.Verdict,
-		Confidence:       assessment.Confidence,
-		Reasoning:        sanitizer.RedactText(assessment.Reasoning),
-		EvidenceLocation: sanitizer.RedactText(assessment.EvidenceLocation),
-	}
-}
+Cite the most relevant section headers or quoted snippets in citations.`

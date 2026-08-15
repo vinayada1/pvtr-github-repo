@@ -1,6 +1,7 @@
 # ignore the generated artifacts
 pvtr-github-repo
 github-repo
+badge-url
 evaluation_results
 
 # ignore any local dev config file
@@ -20,3 +21,9 @@ TODO.md
 
 # ignore ci testing folder
 tmp/
+
+# ignore local git worktrees
+.worktrees/
+
+# github issue template config
+!.github/ISSUE_TEMPLATE/config.yml
